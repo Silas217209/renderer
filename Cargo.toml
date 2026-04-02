@@ -1,12 +1,22 @@
 [package]
-name = "map_renderer"
+name = "renderer"
 version = "0.1.0"
 edition = "2024"
+publish = false
 
 [dependencies]
 anyhow = "1.0.102"
+bytemuck = { version = "1.25.0", features = ["derive"] }
 env_logger = "0.11.10"
+glam = { version = "0.32.1", features = ["bytemuck"] }
 log = "0.4.29"
 pollster = "0.4.0"
-wgpu = "29.0.1"
-winit = "0.30.13"
+wgpu = { version = "29.0.1", default-features = false, features = ["wgsl", "vulkan", "metal", "dx12"] }
+winit = { version = "0.30.13", default-features = false, features = ["rwh_06", "wayland", "x11"] }
+#simd = { path = "crates/simd" }
+
+["workspace"]
+members = [
+    "crates/*",
+    "crates/gpu/gpu-macros"
+]
