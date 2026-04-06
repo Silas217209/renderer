@@ -12,11 +12,8 @@ glam = { version = "0.32.1", features = ["bytemuck"] }
 log = "0.4.29"
 pollster = "0.4.0"
 wgpu = { version = "29.0.1", default-features = false, features = ["wgsl", "vulkan", "metal", "dx12"] }
-winit = { version = "0.30.13", default-features = false, features = ["rwh_06", "wayland", "x11"] }
-#simd = { path = "crates/simd" }
+winit = { version = "0.30.13", default-features = false, features = ["rwh_06", "wayland"] }
 
-["workspace"]
-members = [
-    "crates/*",
-    "crates/gpu/gpu-macros"
-]
+
+[profile.dev]
+incremental = true
