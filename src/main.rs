@@ -1,203 +1,376 @@
-use pollster::FutureExt;
+mod error;
+
+use crate::error::{AppError, Result};
+use ash::khr::{surface, swapchain};
+use ash::{Entry, ext::debug_utils, vk};
 use std::{default::Default, sync::Arc};
-use wgpu::util::DeviceExt;
-use winit::event_loop::ControlFlow;
+use winit::dpi::PhysicalSize;
+#[allow(deprecated)]
 use winit::{
     application::ApplicationHandler,
     event::WindowEvent,
-    event_loop::{ActiveEventLoop, EventLoop},
+    event_loop::{ActiveEventLoop, ControlFlow, EventLoop},
     keyboard::{KeyCode, PhysicalKey},
+    raw_window_handle::{HasRawDisplayHandle, HasRawWindowHandle},
     window::{Window, WindowId},
 };
 
-#[repr(C)]
-#[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
-struct Vertex {
-    position: [f32; 3],
-    color: [f32; 3],
+pub struct VulkanContext {
+    pub entry: ash::Entry,
+    pub instance: ash::Instance,
+    pub surface_loader: ash::khr::surface::Instance,
+    pub surface: vk::SurfaceKHR,
+    pub physical_device: vk::PhysicalDevice,
+    pub device: ash::Device,
+    pub graphics_queue: vk::Queue,
+    pub graphics_queue_family_index: u32,
 }
 
-impl Vertex {
-    const ATTRIBS: [wgpu::VertexAttribute; 2] =
-        wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3];
-    fn desc() -> wgpu::VertexBufferLayout<'static> {
-        wgpu::VertexBufferLayout {
-            array_stride: size_of::<Vertex>() as wgpu::BufferAddress,
-            step_mode: wgpu::VertexStepMode::Vertex,
-            attributes: &Self::ATTRIBS,
-        }
-    }
-}
+impl VulkanContext {
+    pub fn new(window: &Window) -> Result<Self> {
+        let entry = Entry::linked();
 
-#[rustfmt::skip]
-const VERTICES: &[Vertex] = &[
-    Vertex { position: [0.5, 0.5, 0.0], color: [0.5, 0.0, 0.5] },
-    Vertex { position: [-0.5, 0.5, 0.0], color: [0.5, 0.0, 0.5] },
-    Vertex { position: [-0.5, -0.5, 0.0], color: [0.5, 0.0, 0.5] },
-    Vertex { position: [0.5, -0.5, 0.0], color: [0.5, 0.0, 0.5] },
-];
+        #[allow(deprecated)]
+        let display_handle = window.raw_display_handle().unwrap();
+        #[allow(deprecated)]
+        let window_handle = window.raw_window_handle().unwrap();
 
-const INDICES: &[u16] = &[
-    0, 1, 2, //
-    0, 2, 3, //
-];
+        let mut extension_names =
+            ash_window::enumerate_required_extensions(display_handle)?.to_vec();
+        extension_names.push(debug_utils::NAME.as_ptr());
 
-pub struct State {
-    surface: wgpu::Surface<'static>,
-    device: wgpu::Device,
-    queue: wgpu::Queue,
-    config: wgpu::SurfaceConfiguration,
-    is_surface_configured: bool,
-    render_pipeline: wgpu::RenderPipeline,
-    window: Arc<Window>,
-    vertex_buffer: wgpu::Buffer,
-    index_buffer: wgpu::Buffer,
-    index_count: u32,
-}
+        let app_info = vk::ApplicationInfo::default()
+            .application_name(c"Renderer")
+            .api_version(vk::API_VERSION_1_3);
 
-impl State {
-    pub async fn new(window: Arc<Window>) -> anyhow::Result<State> {
-        let size = window.inner_size();
+        let instance_create_info = vk::InstanceCreateInfo::default()
+            .application_info(&app_info)
+            .enabled_extension_names(extension_names.as_slice());
 
-        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
-            backends: wgpu::Backends::PRIMARY,
-            flags: Default::default(),
-            memory_budget_thresholds: Default::default(),
-            backend_options: Default::default(),
-            display: None,
-        });
+        let instance = unsafe { entry.create_instance(&instance_create_info, None) }?;
 
-        let surface = instance.create_surface(window.clone())?;
+        let surface = unsafe {
+            ash_window::create_surface(&entry, &instance, display_handle, window_handle, None)
+        }?;
 
-        let adapter = instance
-            .enumerate_adapters(wgpu::Backends::all())
-            .await
-            .into_iter()
-            .filter(|adapter| adapter.is_surface_supported(&surface))
-            .next()
-            .unwrap();
+        let surface_loader = surface::Instance::new(&entry, &instance);
 
-        let (device, queue) = adapter
-            .request_device(&wgpu::DeviceDescriptor {
-                label: None,
-                required_features: wgpu::Features {
-                    features_wgpu: wgpu::FeaturesWGPU::POLYGON_MODE_LINE
-                        | wgpu::FeaturesWGPU::POLYGON_MODE_POINT,
-                    features_webgpu: wgpu::FeaturesWebGPU::empty(),
-                },
-                experimental_features: wgpu::ExperimentalFeatures::disabled(),
-                required_limits: wgpu::Limits {
-                    max_buffer_size: 512 * 2024 * 2024,
-                    max_storage_buffer_binding_size: 512 * 2014 * 1024,
-                    ..Default::default()
-                },
-                memory_hints: Default::default(),
-                trace: wgpu::Trace::Off,
-            })
-            .await?;
-
-        let surface_caps = surface.get_capabilities(&adapter);
-
-        let surface_format = surface_caps
-            .formats
+        let physical_devices = unsafe { instance.enumerate_physical_devices() }?;
+        let (physical_device, queue_family_index) = physical_devices
             .iter()
-            .find(|s| s.is_srgb())
-            .copied()
-            .unwrap_or(surface_caps.formats[0]);
+            .filter_map(|&physical_device| {
+                let properties =
+                    unsafe { instance.get_physical_device_properties(physical_device) };
 
-        let config = wgpu::SurfaceConfiguration {
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
-            format: surface_format,
-            width: size.width,
-            height: size.height,
-            present_mode: surface_caps.present_modes[0],
-            alpha_mode: surface_caps.alpha_modes[0],
-            view_formats: vec![],
-            desired_maximum_frame_latency: 2,
+                let queue_family_index = unsafe {
+                    instance.get_physical_device_queue_family_properties(physical_device)
+                }
+                .iter()
+                .enumerate()
+                .find_map(|(index, info)| {
+                    let index = index as u32;
+                    let has_graphics = info.queue_flags.contains(vk::QueueFlags::GRAPHICS);
+                    let has_surface = unsafe {
+                        surface_loader.get_physical_device_surface_support(
+                            physical_device,
+                            index,
+                            surface,
+                        )
+                    }
+                    .unwrap_or(false);
+
+                    if has_graphics && has_surface {
+                        Some(index)
+                    } else {
+                        None
+                    }
+                })?;
+
+                // TODO: score better
+                let mut score = 0;
+                score += match properties.device_type {
+                    vk::PhysicalDeviceType::DISCRETE_GPU => 1_000_000,
+                    vk::PhysicalDeviceType::INTEGRATED_GPU => 100_000,
+                    vk::PhysicalDeviceType::VIRTUAL_GPU => 10_000,
+                    vk::PhysicalDeviceType::CPU => 1_000,
+                    _ => 0,
+                };
+
+                println!(
+                    "device: {}, score: {}",
+                    properties.device_name_as_c_str().unwrap().to_str().unwrap(),
+                    score
+                );
+
+                Some((score, (physical_device, queue_family_index)))
+            })
+            .max_by_key(|(score, _)| *score)
+            .map(|(_, device_info)| device_info)
+            .expect("Couldn't find suitable device");
+
+        let priorities: [f32; _] = [1.0];
+
+        let queue_info = vk::DeviceQueueCreateInfo::default()
+            .queue_family_index(queue_family_index)
+            .queue_priorities(&priorities);
+
+        let device_extension_names_raw = [swapchain::NAME.as_ptr()];
+
+        let features = vk::PhysicalDeviceFeatures {
+            shader_clip_distance: 1,
+            ..Default::default()
         };
 
-        let shader = device.create_shader_module(wgpu::include_wgsl!("shaders/shader.wgsl"));
-        let render_pipeline_layout =
-            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                label: Some("Render Pipeline Layout"),
-                bind_group_layouts: &[],
-                immediate_size: 0,
-            });
+        let device_create_info = vk::DeviceCreateInfo::default()
+            .queue_create_infos(std::slice::from_ref(&queue_info))
+            .enabled_extension_names(&device_extension_names_raw)
+            .enabled_features(&features);
 
-        let render_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("Render Pipeline"),
-            layout: Some(&render_pipeline_layout),
-            vertex: wgpu::VertexState {
-                module: &shader,
-                entry_point: Some("vs_main"),
-                buffers: &[Vertex::desc()],
-                compilation_options: wgpu::PipelineCompilationOptions::default(),
-            },
-            fragment: Some(wgpu::FragmentState {
-                module: &shader,
-                entry_point: Some("fs_main"),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format: config.format,
-                    blend: Some(wgpu::BlendState::REPLACE),
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-                compilation_options: wgpu::PipelineCompilationOptions::default(),
-            }),
-            primitive: wgpu::PrimitiveState {
-                topology: wgpu::PrimitiveTopology::TriangleList,
-                strip_index_format: None,
-                front_face: wgpu::FrontFace::Ccw,
-                cull_mode: Some(wgpu::Face::Back),
-                polygon_mode: wgpu::PolygonMode::Fill,
-                unclipped_depth: false,
-                conservative: false,
-            },
-            depth_stencil: None,
-            multisample: wgpu::MultisampleState {
-                count: 1,
-                mask: !0,
-                alpha_to_coverage_enabled: false,
-            },
-            multiview_mask: None,
-            cache: None,
-        });
+        let device = unsafe { instance.create_device(physical_device, &device_create_info, None)? };
 
-        let vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("Vertex Buffer"),
-            contents: bytemuck::cast_slice(VERTICES),
-            usage: wgpu::BufferUsages::VERTEX,
-        });
-
-        let index_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("Index Buffer"),
-            contents: bytemuck::cast_slice(INDICES),
-            usage: wgpu::BufferUsages::INDEX,
-        });
-
-        let index_count = INDICES.len() as u32;
+        let graphics_queue = unsafe { device.get_device_queue(queue_family_index, 0) };
 
         Ok(Self {
+            entry,
+            instance,
+            surface_loader,
             surface,
+            physical_device,
             device,
-            queue,
-            config,
-            is_surface_configured: false,
-            render_pipeline,
-            window,
-            vertex_buffer,
-            index_buffer,
-            index_count,
+            graphics_queue,
+            graphics_queue_family_index: queue_family_index,
         })
     }
 
-    pub fn resize(&mut self, width: u32, height: u32) {
-        if width > 0 && height > 0 {
-            self.config.width = width;
-            self.config.height = height;
-            self.surface.configure(&self.device, &self.config);
-            self.is_surface_configured = true;
+    pub fn destroy(self) {
+        unsafe {
+            self.device.device_wait_idle().unwrap();
+
+            self.device.destroy_device(None);
+            self.surface_loader.destroy_surface(self.surface, None);
+            self.instance.destroy_instance(None);
         }
     }
+}
+
+pub struct SwapchainContext {
+    pub swapchain_loader: ash::khr::swapchain::Device,
+    pub images: Vec<vk::Image>,
+    pub image_views: Vec<vk::ImageView>,
+    pub extent: vk::Extent2D,
+    pub format: vk::Format,
+    swapchain: vk::SwapchainKHR,
+}
+
+impl SwapchainContext {
+    pub fn new(context: &VulkanContext, window_size: PhysicalSize<u32>) -> Result<Self> {
+        let swapchain_loader = swapchain::Device::new(&context.instance, &context.device);
+
+        let surface_format = unsafe {
+            context
+                .surface_loader
+                .get_physical_device_surface_formats(context.physical_device, context.surface)?[0]
+        };
+
+        let surface_capabilities = unsafe {
+            context
+                .surface_loader
+                .get_physical_device_surface_capabilities(
+                    context.physical_device,
+                    context.surface,
+                )?
+        };
+
+        let mut desired_image_count = surface_capabilities.min_image_count + 1;
+        if surface_capabilities.max_image_count > 0
+            && desired_image_count > surface_capabilities.max_image_count
+        {
+            desired_image_count = surface_capabilities.max_image_count;
+        }
+
+        let extent = match surface_capabilities.current_extent.width {
+            u32::MAX => vk::Extent2D {
+                width: window_size.width,
+                height: window_size.height,
+            },
+            _ => surface_capabilities.current_extent,
+        };
+
+        let pre_transform = if surface_capabilities
+            .supported_transforms
+            .contains(vk::SurfaceTransformFlagsKHR::IDENTITY)
+        {
+            vk::SurfaceTransformFlagsKHR::IDENTITY
+        } else {
+            surface_capabilities.current_transform
+        };
+
+        let present_modes = unsafe {
+            context
+                .surface_loader
+                .get_physical_device_surface_present_modes(context.physical_device, context.surface)
+        }?;
+
+        let present_mode = present_modes
+            .iter()
+            .cloned()
+            .find(|&mode| mode == vk::PresentModeKHR::MAILBOX)
+            .unwrap_or(vk::PresentModeKHR::FIFO);
+
+        let swapchain_create_info = vk::SwapchainCreateInfoKHR::default()
+            .surface(context.surface)
+            .min_image_count(desired_image_count)
+            .image_color_space(surface_format.color_space)
+            .image_format(surface_format.format)
+            .image_extent(extent)
+            .image_usage(vk::ImageUsageFlags::COLOR_ATTACHMENT)
+            .image_sharing_mode(vk::SharingMode::EXCLUSIVE)
+            .pre_transform(pre_transform)
+            .composite_alpha(vk::CompositeAlphaFlagsKHR::OPAQUE)
+            .present_mode(present_mode)
+            .clipped(true)
+            .image_array_layers(1);
+
+        let swapchain = unsafe { swapchain_loader.create_swapchain(&swapchain_create_info, None)? };
+
+        let images = unsafe { swapchain_loader.get_swapchain_images(swapchain) }?;
+        let image_views: Vec<vk::ImageView> = images
+            .iter()
+            .map(|&image| {
+                let create_view_info = vk::ImageViewCreateInfo::default()
+                    .view_type(vk::ImageViewType::TYPE_2D)
+                    .format(surface_format.format)
+                    .components(vk::ComponentMapping {
+                        r: vk::ComponentSwizzle::R,
+                        g: vk::ComponentSwizzle::G,
+                        b: vk::ComponentSwizzle::B,
+                        a: vk::ComponentSwizzle::A,
+                    })
+                    .subresource_range(vk::ImageSubresourceRange {
+                        aspect_mask: vk::ImageAspectFlags::COLOR,
+                        base_mip_level: 0,
+                        level_count: 1,
+                        base_array_layer: 0,
+                        layer_count: 1,
+                    })
+                    .image(image);
+                unsafe {
+                    context
+                        .device
+                        .create_image_view(&create_view_info, None)
+                        .unwrap()
+                }
+            })
+            .collect();
+
+        Ok(Self {
+            swapchain_loader,
+            swapchain,
+            images,
+            image_views,
+            extent,
+            format: surface_format.format,
+        })
+    }
+
+    pub fn destroy(self, device: &ash::Device) {
+        unsafe {
+            device.device_wait_idle().unwrap();
+
+            self.image_views.iter().for_each(|&image_view| {
+                device.destroy_image_view(image_view, None);
+            });
+
+            self.swapchain_loader
+                .destroy_swapchain(self.swapchain, None);
+        }
+    }
+}
+
+pub struct FrameData {
+    pub command_pool: vk::CommandPool,
+    pub main_command_buffer: vk::CommandBuffer,
+    pub image_available_semaphore: vk::Semaphore,
+    pub render_finished_semaphore: vk::Semaphore,
+    pub render_fence: vk::Fence,
+}
+
+impl FrameData {
+    pub fn new(context: &VulkanContext) -> Result<Self> {
+        let device = &context.device;
+
+        let pool_create_info = vk::CommandPoolCreateInfo::default()
+            .flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER)
+            .queue_family_index(context.graphics_queue_family_index);
+
+        let pool = unsafe { device.create_command_pool(&pool_create_info, None)? };
+
+        let command_buffer_allocate_info = vk::CommandBufferAllocateInfo::default()
+            .command_buffer_count(1)
+            .command_pool(pool)
+            .level(vk::CommandBufferLevel::PRIMARY);
+
+        let command_buffer =
+            unsafe { device.allocate_command_buffers(&command_buffer_allocate_info)? }[0];
+
+        let semaphore_info = vk::SemaphoreCreateInfo::default();
+
+        let image_available_semaphore = unsafe { device.create_semaphore(&semaphore_info, None)? };
+        let render_finished_semaphore = unsafe { device.create_semaphore(&semaphore_info, None)? };
+
+        let fence_info = vk::FenceCreateInfo::default().flags(vk::FenceCreateFlags::SIGNALED);
+
+        let render_fence = unsafe { device.create_fence(&fence_info, None)? };
+
+        Ok(Self {
+            command_pool: pool,
+            main_command_buffer: command_buffer,
+            image_available_semaphore,
+            render_finished_semaphore,
+            render_fence,
+        })
+    }
+
+    pub fn destroy(self, device: &ash::Device) {
+        unsafe {
+            device.device_wait_idle().unwrap();
+
+            device.destroy_fence(self.render_fence, None);
+            device.destroy_semaphore(self.render_finished_semaphore, None);
+            device.destroy_semaphore(self.image_available_semaphore, None);
+            device.destroy_command_pool(self.command_pool, None);
+        }
+    }
+}
+
+pub struct State {
+    window: Arc<Window>,
+    vulkan_context: VulkanContext,
+    swapchain_context: SwapchainContext,
+    frames: [FrameData; 2],
+}
+
+impl State {
+    pub fn new(window: Arc<Window>) -> Result<Self> {
+        let window_size = window.inner_size();
+
+        let vulkan_context = VulkanContext::new(&window)?;
+        let swapchain_context = SwapchainContext::new(&vulkan_context, window_size)?;
+
+        let frames = [
+            FrameData::new(&vulkan_context)?,
+            FrameData::new(&vulkan_context)?,
+        ];
+
+        Ok(Self {
+            window,
+            vulkan_context,
+            swapchain_context,
+            frames,
+        })
+    }
+
+    pub fn resize(&mut self, _width: u32, _height: u32) {}
 
     pub fn handle_key(&mut self, event_loop: &ActiveEventLoop, code: KeyCode, is_pressed: bool) {
         match (code, is_pressed) {
@@ -206,72 +379,8 @@ impl State {
         }
     }
 
-    pub fn render(&mut self) -> anyhow::Result<()> {
+    pub fn render(&mut self) -> Result<()> {
         self.window.request_redraw();
-
-        if !self.is_surface_configured {
-            return Ok(());
-        }
-
-        let output = match self.surface.get_current_texture() {
-            wgpu::CurrentSurfaceTexture::Success(surface_texture) => surface_texture,
-            wgpu::CurrentSurfaceTexture::Suboptimal(surface_texture) => {
-                self.surface.configure(&self.device, &self.config);
-                surface_texture
-            }
-            wgpu::CurrentSurfaceTexture::Timeout
-            | wgpu::CurrentSurfaceTexture::Occluded
-            | wgpu::CurrentSurfaceTexture::Validation => return Ok(()),
-            wgpu::CurrentSurfaceTexture::Outdated => {
-                self.surface.configure(&self.device, &self.config);
-                return Ok(());
-            }
-            wgpu::CurrentSurfaceTexture::Lost => {
-                anyhow::bail!("Lost Device");
-            }
-        };
-
-        let view = output
-            .texture
-            .create_view(&wgpu::TextureViewDescriptor::default());
-
-        let mut encoder = self
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("Render Encoder"),
-            });
-
-        {
-            let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("Render Pass"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &view,
-                    resolve_target: None,
-                    depth_slice: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color {
-                            r: 0.0,
-                            g: 0.0,
-                            b: 0.0,
-                            a: 1.0,
-                        }),
-                        store: wgpu::StoreOp::Store,
-                    },
-                })],
-                depth_stencil_attachment: None,
-                occlusion_query_set: None,
-                timestamp_writes: None,
-                multiview_mask: None,
-            });
-
-            render_pass.set_pipeline(&self.render_pipeline);
-            render_pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
-            render_pass.set_index_buffer(self.index_buffer.slice(..), wgpu::IndexFormat::Uint16);
-            render_pass.draw_indexed(0..self.index_count, 0, 0..1);
-        }
-
-        self.queue.submit(std::iter::once(encoder.finish()));
-        output.present();
 
         Ok(())
     }
@@ -291,7 +400,7 @@ impl ApplicationHandler for App {
         let window_attrs = Window::default_attributes().with_title("Map Renderer");
         let window = Arc::new(event_loop.create_window(window_attrs).unwrap());
 
-        self.state = Some(State::new(window).block_on().unwrap());
+        self.state = Some(State::new(window).unwrap());
     }
 
     fn window_event(
@@ -322,11 +431,27 @@ impl ApplicationHandler for App {
             _ => (),
         }
     }
+
+    fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
+        let Some(state) = self.state.take() else {
+            return;
+        };
+
+        let device = &state.vulkan_context.device;
+
+        unsafe { device.device_wait_idle().unwrap() };
+        state
+            .frames
+            .into_iter()
+            .for_each(|frame| frame.destroy(&device));
+
+        state.swapchain_context.destroy(&device);
+        state.vulkan_context.destroy();
+        println!("Hello");
+    }
 }
 
 fn main() {
-    env_logger::init();
-
     let event_loop = EventLoop::new().unwrap();
     event_loop.set_control_flow(ControlFlow::Wait);
     let mut app = App::default();

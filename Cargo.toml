@@ -5,13 +5,12 @@ edition = "2024"
 publish = false
 
 [dependencies]
-anyhow = "1.0.102"
+ash = { version = "0.38.0", features = ["linked"] }
+ash-window = "0.13.0"
 bytemuck = { version = "1.25.0", features = ["derive"] }
-env_logger = "0.11.10"
 glam = { version = "0.32.1", features = ["bytemuck"] }
 log = "0.4.29"
-pollster = "0.4.0"
-wgpu = { version = "29.0.1", default-features = false, features = ["wgsl", "vulkan", "metal", "dx12"] }
+thiserror = "2.0.18"
 winit = { version = "0.30.13", default-features = false, features = ["rwh_06", "wayland"] }
 
 
