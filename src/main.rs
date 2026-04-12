@@ -3,6 +3,7 @@ mod error;
 use crate::error::{AppError, Result};
 use ash::khr::{surface, swapchain};
 use ash::{Entry, ext::debug_utils, vk};
+use std::u64;
 use std::{default::Default, sync::Arc};
 use winit::dpi::PhysicalSize;
 #[allow(deprecated)]
@@ -287,6 +288,8 @@ impl SwapchainContext {
     }
 }
 
+const FRAME_OVERLAP: usize = 2;
+
 pub struct FrameData {
     pub command_pool: vk::CommandPool,
     pub main_command_buffer: vk::CommandBuffer,
@@ -348,6 +351,7 @@ pub struct State {
     vulkan_context: VulkanContext,
     swapchain_context: SwapchainContext,
     frames: [FrameData; 2],
+    frame_number: usize,
 }
 
 impl State {
@@ -357,7 +361,7 @@ impl State {
         let vulkan_context = VulkanContext::new(&window)?;
         let swapchain_context = SwapchainContext::new(&vulkan_context, window_size)?;
 
-        let frames = [
+        let frames: [FrameData; FRAME_OVERLAP] = [
             FrameData::new(&vulkan_context)?,
             FrameData::new(&vulkan_context)?,
         ];
@@ -367,7 +371,12 @@ impl State {
             vulkan_context,
             swapchain_context,
             frames,
+            frame_number: 0,
         })
+    }
+
+    pub fn get_current_frame(&self) -> &FrameData {
+        return &self.frames[self.frame_number % FRAME_OVERLAP];
     }
 
     pub fn resize(&mut self, _width: u32, _height: u32) {}
@@ -379,8 +388,138 @@ impl State {
         }
     }
 
+    fn transition_image_layout(
+        &self,
+        cmd: vk::CommandBuffer,
+        image: vk::Image,
+        old_layout: vk::ImageLayout,
+        new_layout: vk::ImageLayout,
+    ) {
+        let barrier = vk::ImageMemoryBarrier::default()
+            .old_layout(old_layout)
+            .new_layout(new_layout)
+            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .image(image)
+            .subresource_range(vk::ImageSubresourceRange {
+                aspect_mask: vk::ImageAspectFlags::COLOR,
+                base_mip_level: 0,
+                level_count: 1,
+                base_array_layer: 0,
+                layer_count: 1,
+            })
+            .src_access_mask(vk::AccessFlags::empty())
+            .dst_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE);
+
+        unsafe {
+            self.vulkan_context.device.cmd_pipeline_barrier(
+                cmd,
+                vk::PipelineStageFlags::TOP_OF_PIPE,
+                vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                &[barrier],
+            );
+        }
+    }
+
     pub fn render(&mut self) -> Result<()> {
         self.window.request_redraw();
+
+        let frame_data = self.get_current_frame();
+        let device = &self.vulkan_context.device;
+
+        unsafe {
+            device.wait_for_fences(&[frame_data.render_fence], true, u64::MAX)?;
+            device.reset_fences(&[frame_data.render_fence])?;
+
+            let (image_index, _is_suboptimal) =
+                self.swapchain_context.swapchain_loader.acquire_next_image(
+                    self.swapchain_context.swapchain,
+                    u64::MAX,
+                    frame_data.image_available_semaphore,
+                    vk::Fence::null(),
+                )?;
+
+            let cmd = frame_data.main_command_buffer;
+            device.reset_command_buffer(cmd, vk::CommandBufferResetFlags::empty())?;
+
+            let begin_info = vk::CommandBufferBeginInfo::default()
+                .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
+
+            device.begin_command_buffer(cmd, &begin_info)?;
+
+            let swapchain_image = self.swapchain_context.images[image_index as usize];
+            self.transition_image_layout(
+                cmd,
+                swapchain_image,
+                vk::ImageLayout::UNDEFINED,
+                vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+            );
+
+            let color_attachment = vk::RenderingAttachmentInfo::default()
+                .image_view(self.swapchain_context.image_views[image_index as usize])
+                .image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+                .load_op(vk::AttachmentLoadOp::CLEAR)
+                .store_op(vk::AttachmentStoreOp::STORE)
+                .clear_value(vk::ClearValue {
+                    color: vk::ClearColorValue {
+                        float32: [0.1, 0.1, 0.1, 1.0],
+                    },
+                });
+
+            let rendering_info = vk::RenderingInfo::default()
+                .render_area(self.swapchain_context.extent.into())
+                .layer_count(1)
+                .color_attachments(std::slice::from_ref(&color_attachment));
+
+            device.cmd_begin_rendering(cmd, &rendering_info);
+
+            //
+            //
+            //
+
+            device.cmd_end_rendering(cmd);
+
+            self.transition_image_layout(
+                cmd,
+                swapchain_image,
+                vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+                vk::ImageLayout::PRESENT_SRC_KHR,
+            );
+
+            device.end_command_buffer(cmd)?;
+
+            let wait_semaphores = [frame_data.image_available_semaphore];
+            let wait_stages = [vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT];
+            let signal_semaphores = [frame_data.render_finished_semaphore];
+
+            let submit_inof = vk::SubmitInfo::default()
+                .wait_semaphores(&wait_semaphores)
+                .wait_dst_stage_mask(&wait_stages)
+                .command_buffers(std::slice::from_ref(&cmd))
+                .signal_semaphores(&signal_semaphores);
+
+            device.queue_submit(
+                self.vulkan_context.graphics_queue,
+                &[submit_inof],
+                frame_data.render_fence,
+            )?;
+
+            let swapchains = [self.swapchain_context.swapchain];
+            let image_indices = [image_index];
+            let present_info = vk::PresentInfoKHR::default()
+                .wait_semaphores(&signal_semaphores)
+                .swapchains(&swapchains)
+                .image_indices(&image_indices);
+
+            self.swapchain_context
+                .swapchain_loader
+                .queue_present(self.vulkan_context.graphics_queue, &present_info)?;
+
+            self.frame_number += 1;
+        };
 
         Ok(())
     }
